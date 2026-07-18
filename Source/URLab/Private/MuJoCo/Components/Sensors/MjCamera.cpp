@@ -326,6 +326,26 @@ void UMjCamera::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	Super::EndPlay(EndPlayReason);
 }
 
+void UMjCamera::BeginDestroy()
+{
+	// NetworkManager's ActiveCameras holds raw pointers, and EndPlay never
+	// fires for MJCF-imported cameras (they skip BeginPlay). BeginDestroy is
+	// guaranteed for every UObject, so unregister here to keep the registry
+	// free of dangling entries across PIE restarts.
+	if (bNetworkManagerRegistered)
+	{
+		bNetworkManagerRegistered = false;
+		if (AAMjManager* Manager = AAMjManager::GetManager())
+		{
+			if (Manager->NetworkManager)
+			{
+				Manager->NetworkManager->UnregisterCamera(this);
+			}
+		}
+	}
+	Super::BeginDestroy();
+}
+
 void UMjCamera::TickComponent(float DeltaTime, ELevelTick TickType,
 	FActorComponentTickFunction* ThisTickFunction)
 {
@@ -504,6 +524,33 @@ void UMjCamera::SetStreamingEnabled(bool bEnable)
 {
 	if (bEnable)
 	{
+		// MJCF-imported cameras are created with NewObject during import and
+		// never run BeginPlay, so the UMjNetworkManager registration there
+		// (the only place bEnableZmqBroadcast/bEnableShmBroadcast get set from
+		// the global toggle) never happens for them — the ZMQ/SHM publisher
+		// blocks below then never start. Register lazily on first enable.
+		// The guard is set BEFORE RegisterCamera because RegisterCamera
+		// re-enters SetStreamingEnabled; one level of re-entry then completes
+		// with the broadcast flags set, and this block is skipped.
+		if (!bNetworkManagerRegistered)
+		{
+			if (AAMjManager* Manager = AAMjManager::GetManager())
+			{
+				if (Manager->NetworkManager)
+				{
+					bNetworkManagerRegistered = true;
+					Manager->NetworkManager->RegisterCamera(this);
+					if (bStreamingEnabled)
+					{
+						return; // Toggle was on: re-entry already ran the full enable path.
+					}
+					// Toggle was off: RegisterCamera disabled streaming. Fall
+					// through and enable rendering locally (RT + capture, no
+					// broadcast) so UI feeds keep working — pre-patch behavior.
+				}
+			}
+		}
+
 		if (!RenderTarget)
 		{
 			SetupRenderTarget();

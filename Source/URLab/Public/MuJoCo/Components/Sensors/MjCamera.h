@@ -319,11 +319,20 @@ protected:
 		FActorComponentTickFunction* ThisTickFunction) override;
 	virtual void OnRegister() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void BeginDestroy() override;
 
 private:
 	// ---- Internal helpers ----
 	void SetupRenderTarget();
 	void RegisterWithStreamingManager();
+
+	/** True once this camera has been handed to UMjNetworkManager::RegisterCamera.
+	 *  MJCF-imported cameras never run BeginPlay (created via NewObject during
+	 *  import), so registration happens lazily in SetStreamingEnabled(true);
+	 *  this guard makes that idempotent and breaks the RegisterCamera ->
+	 *  SetStreamingEnabled re-entry loop. Cleared via UnregisterCamera in
+	 *  BeginDestroy (EndPlay never fires for BeginPlay-less components). */
+	bool bNetworkManagerRegistered = false;
 
 	/** Refresh HiddenComponents from live seg pools so a late-starting seg
 	 *  camera doesn't contaminate an already-streaming RGB/Depth capture. */

@@ -33,6 +33,112 @@
 #include "RenderingThread.h"
 #include "ShaderCompiler.h"
 #include "URLabEditorLogging.h"
+#include "XmlFile.h"
+#include "Misc/MessageDialog.h"
+#include "Misc/App.h"
+
+// ============================================================================
+// Angle-units sanity gate
+// ============================================================================
+// MJCF defaults to angle="degree" when no <compiler> tag is present, but
+// menagerie/Playground-style robot files author joint ranges in RADIANS and
+// rely on <compiler angle="radian"> — a tag that is easily lost when the file
+// is copied around. Importing such a file silently compiles every joint limit
+// /57.3 (e.g. a Go1 thigh range of [-0.686, 4.501] rad becomes ~±1°): the legs
+// are pinned nearly straight, actuators saturate against the limits, and the
+// robot is uncontrollable.
+//
+// Heuristic: if the file declares NO explicit angle units anywhere, yet every
+// hinge/ball <joint range> value is within ±2π, the ranges are almost
+// certainly radians — a real robot whose joint limits all sit inside ±6.3
+// DEGREES does not exist. Warn (and let the user abort) before any values are
+// baked into components.
+//
+// Returns false when the user chose to abort the import.
+static bool URLabCheckMjcfAngleUnits(const FString& Filename)
+{
+	FXmlFile Xml(Filename);
+	if (!Xml.IsValid())
+	{
+		return true; // XML errors surface later in the normal import path
+	}
+	const FXmlNode* Root = Xml.GetRootNode();
+	if (!Root || !Root->GetTag().Equals(TEXT("mujoco"), ESearchCase::IgnoreCase))
+	{
+		return true; // not a MuJoCo model file
+	}
+
+	bool bExplicitAngle = false;
+	double MaxAbsRange = 0.0;
+	int32 NumRangeValues = 0;
+
+	TFunction<void(const FXmlNode*)> Walk = [&](const FXmlNode* Node)
+	{
+		for (const FXmlNode* Child : Node->GetChildrenNodes())
+		{
+			const FString Tag = Child->GetTag();
+			if (Tag.Equals(TEXT("compiler"), ESearchCase::IgnoreCase))
+			{
+				if (!Child->GetAttribute(TEXT("angle")).IsEmpty())
+				{
+					bExplicitAngle = true;
+				}
+			}
+			else if (Tag.Equals(TEXT("joint"), ESearchCase::IgnoreCase))
+			{
+				// Only angular joints: hinge (default when type is omitted) and
+				// ball ranges are angles; slide ranges are metres — skip those.
+				const FString Type = Child->GetAttribute(TEXT("type"));
+				const bool bAngular = Type.IsEmpty() ||
+					Type.Equals(TEXT("hinge"), ESearchCase::IgnoreCase) ||
+					Type.Equals(TEXT("ball"), ESearchCase::IgnoreCase);
+				const FString Range = Child->GetAttribute(TEXT("range"));
+				if (bAngular && !Range.IsEmpty())
+				{
+					TArray<FString> Parts;
+					Range.ParseIntoArrayWS(Parts);
+					for (const FString& P : Parts)
+					{
+						MaxAbsRange = FMath::Max(MaxAbsRange, FMath::Abs(FCString::Atod(*P)));
+						++NumRangeValues;
+					}
+				}
+			}
+			Walk(Child);
+		}
+	};
+	Walk(Root);
+
+	if (bExplicitAngle || NumRangeValues == 0 || MaxAbsRange > 6.6)
+	{
+		return true; // explicit units, no ranged angular joints, or clearly degrees
+	}
+
+	UE_LOG(LogURLabEditor, Warning,
+		TEXT("MujocoImportFactory: '%s' declares no <compiler angle=...> (MJCF default is "
+			 "DEGREES) but all %d hinge/ball range values are within ±2π (max |v| = %.3f) — "
+			 "they look like RADIANS. Importing as-is shrinks every joint limit ~57.3x and "
+			 "the robot will be locked nearly rigid. Add <compiler angle=\"radian\" "
+			 "autolimits=\"true\"/> to the file and re-import."),
+		*Filename, NumRangeValues, MaxAbsRange);
+
+	if (FApp::IsUnattended() || GIsRunningUnattendedScript)
+	{
+		return true; // headless import: warn in the log but do not block
+	}
+
+	const FText Msg = FText::Format(NSLOCTEXT("URLab", "MjcfAngleUnitsSuspicion",
+		"'{0}' has no <compiler angle=...> tag, so MuJoCo will read its angles as DEGREES.\n\n"
+		"However, every hinge/ball joint range in the file is within ±2π "
+		"(max |value| = {1}) — these look like RADIANS. Imported as degrees, all joint "
+		"limits shrink ~57x and the robot will be locked nearly rigid.\n\n"
+		"Recommended: cancel, add <compiler angle=\"radian\" autolimits=\"true\"/> to the "
+		"file, then import again.\n\nContinue importing anyway?"),
+		FText::FromString(FPaths::GetCleanFilename(Filename)),
+		FText::AsNumber(MaxAbsRange));
+
+	return FMessageDialog::Open(EAppMsgType::YesNo, Msg) == EAppReturnType::Yes;
+}
 
 UMujocoImportFactory::UMujocoImportFactory()
 {
@@ -49,6 +155,15 @@ bool UMujocoImportFactory::FactoryCanImport(const FString& Filename)
 
 UObject* UMujocoImportFactory::FactoryCreateFile(UClass* InClass, UObject* InParent, FName InName, EObjectFlags Flags, const FString& Filename, const TCHAR* Parms, FFeedbackContext* Warn, bool& bOutOperationCanceled)
 {
+	// Gate: catch radian-authored files about to be read as degrees BEFORE any
+	// values are baked into components (see URLabCheckMjcfAngleUnits above).
+	if (!URLabCheckMjcfAngleUnits(Filename))
+	{
+		UE_LOG(LogURLabEditor, Log, TEXT("Import of '%s' cancelled by user (angle-units check)."), *Filename);
+		bOutOperationCanceled = true;
+		return nullptr;
+	}
+
 	// Create blueprint based on AMjArticulation
 	UClass* ParentClass = AMjArticulation::StaticClass();
 

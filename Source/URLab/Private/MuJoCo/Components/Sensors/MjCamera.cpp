@@ -24,6 +24,8 @@
 #include "MuJoCo/Components/Sensors/CameraShmWriter.h"
 #include "MuJoCo/Core/AMjManager.h"
 #include "MuJoCo/Core/MjDebugVisualizer.h"
+#include "MuJoCo/Core/MjRenderSnapshot.h"
+#include "MuJoCo/Core/Spec/MjSpecWrapper.h"
 #include "Transport/NetworkManager.h"
 #include "Transport/ShmPublishTransport.h" // ResolveSessionDir
 #include "Misc/Paths.h"
@@ -41,6 +43,32 @@
 #include "MuJoCo/Core/MjArticulation.h"
 #include "MuJoCo/Utils/MjOrientationUtils.h"
 #include "zmq.h"
+#include "UObject/ObjectKey.h"
+
+// ---------------------------------------------------------------------------
+// [camtx] debug probe
+// ---------------------------------------------------------------------------
+// File-scope, game-thread-only instrumentation for the ghost-wall hunt (no
+// header/layout changes, Live-Coding friendly). The camera wire format
+// carries no per-frame metadata, so these logs are the only way to relate a
+// pushed depth frame to the pose it was rendered at and to when it left UE.
+// Enable with `Log LogURLabNet Verbose`.
+namespace
+{
+	struct FCamTxProbe
+	{
+		uint64 PushSeq = 0;
+		double ReqTimeSec = 0.0;
+		FVector ReqPos = FVector::ZeroVector;
+		float ReqYawDeg = 0.0f;
+	};
+	TMap<FObjectKey, FCamTxProbe> GCamTxProbes;
+
+	double CamTxUnixNowSec()
+	{
+		return (FDateTime::UtcNow() - FDateTime(1970, 1, 1)).GetTotalSeconds();
+	}
+}
 
 // ---------------------------------------------------------------------------
 // FCameraZmqWorker
@@ -64,8 +92,13 @@ bool FCameraZmqWorker::Init()
 	ZmqContext = zmq_ctx_new();
 	ZmqPublisher = zmq_socket(ZmqContext, ZMQ_PUB);
 
-	// Optimize for High Bandwidth (large HWM)
-	int hwm = 10;
+	// Small send HWM: when the subscriber can't keep up, ZMQ PUB *drops*
+	// frames past the HWM instead of blocking. For camera streams a
+	// dropped frame is strictly better than a queued one — a 10-deep
+	// queue of 1.2MB depth frames adds seconds of content latency under
+	// congestion, which downstream consumers turn into ghost geometry by
+	// pairing stale pixels with fresh poses. Keep only the freshest.
+	int hwm = 2;
 	zmq_setsockopt(ZmqPublisher, ZMQ_SNDHWM, &hwm, sizeof(hwm));
 
 	// Simple port increment logic if port is busy
@@ -109,13 +142,20 @@ bool FCameraZmqWorker::Init()
 
 uint32 FCameraZmqWorker::Run()
 {
-	auto SendBinary = [this](const void* Data, size_t Size) {
+	// Reused wire buffer: one payload part of [FMjCameraFrameMeta][pixels]
+	// (urlab_client's parse_camera_frame splits them; a lone-pixels legacy
+	// payload would still decode there, but we always send the header).
+	TArray<uint8> WireBuf;
+	auto SendFrame = [this, &WireBuf](const FMjCameraFrameMeta& Meta, const void* Pixels, size_t PixelBytes) {
 		if (bPublishersPaused.load(std::memory_order_acquire))
 			return;
+		WireBuf.SetNumUninitialized(static_cast<int32>(sizeof(FMjCameraFrameMeta) + PixelBytes));
+		FMemory::Memcpy(WireBuf.GetData(), &Meta, sizeof(FMjCameraFrameMeta));
+		FMemory::Memcpy(WireBuf.GetData() + sizeof(FMjCameraFrameMeta), Pixels, PixelBytes);
 		const FString TopicSpace = Topic + TEXT(" ");
 		const FTCHARToUTF8 TopicUtf8(*TopicSpace);
 		zmq_send(ZmqPublisher, TopicUtf8.Get(), TopicUtf8.Length(), ZMQ_SNDMORE);
-		zmq_send(ZmqPublisher, Data, Size, 0);
+		zmq_send(ZmqPublisher, WireBuf.GetData(), WireBuf.Num(), 0);
 	};
 
 	while (!bStopThread)
@@ -123,22 +163,22 @@ uint32 FCameraZmqWorker::Run()
 		const int32 ExpectedPixels = resolution.X * resolution.Y;
 		bool bSent = false;
 
-		TArray<FColor> ColorFrame;
-		if (FrameQueue.Dequeue(ColorFrame))
+		TPair<FMjCameraFrameMeta, TArray<FColor>> ColorItem;
+		if (FrameQueue.Dequeue(ColorItem))
 		{
-			if (ColorFrame.Num() == ExpectedPixels)
+			if (ColorItem.Value.Num() == ExpectedPixels)
 			{
-				SendBinary(ColorFrame.GetData(), ColorFrame.Num() * sizeof(FColor));
+				SendFrame(ColorItem.Key, ColorItem.Value.GetData(), ColorItem.Value.Num() * sizeof(FColor));
 			}
 			bSent = true;
 		}
 
-		TArray<float> FloatFrame;
-		if (FloatFrameQueue.Dequeue(FloatFrame))
+		TPair<FMjCameraFrameMeta, TArray<float>> FloatItem;
+		if (FloatFrameQueue.Dequeue(FloatItem))
 		{
-			if (FloatFrame.Num() == ExpectedPixels)
+			if (FloatItem.Value.Num() == ExpectedPixels)
 			{
-				SendBinary(FloatFrame.GetData(), FloatFrame.Num() * sizeof(float));
+				SendFrame(FloatItem.Key, FloatItem.Value.GetData(), FloatItem.Value.Num() * sizeof(float));
 			}
 			bSent = true;
 		}
@@ -170,17 +210,17 @@ void FCameraZmqWorker::Exit()
 	}
 }
 
-void FCameraZmqWorker::PushFrame(const TArray<FColor>& FrameData)
+void FCameraZmqWorker::PushFrame(const FMjCameraFrameMeta& Meta, const TArray<FColor>& FrameData)
 {
 	// ZMQ HWM on the socket handles network-side backpressure if the
 	// queue grows. TQueue lacks a cheap Count(), so don't try to drop
 	// here.
-	FrameQueue.Enqueue(FrameData);
+	FrameQueue.Enqueue(TPair<FMjCameraFrameMeta, TArray<FColor>>(Meta, FrameData));
 }
 
-void FCameraZmqWorker::PushFrame(const TArray<float>& FrameData)
+void FCameraZmqWorker::PushFrame(const FMjCameraFrameMeta& Meta, const TArray<float>& FrameData)
 {
-	FloatFrameQueue.Enqueue(FrameData);
+	FloatFrameQueue.Enqueue(TPair<FMjCameraFrameMeta, TArray<float>>(Meta, FrameData));
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +301,32 @@ void UMjCamera::OnRegister()
 	Super::OnRegister();
 	if (CaptureComponent)
 	{
-		CaptureComponent->FOVAngle = fovy;
+		CaptureComponent->FOVAngle = ComputeHorizontalFovDeg();
 	}
+}
+
+float UMjCamera::ComputeHorizontalFovDeg() const
+{
+	// MJCF fovy is a VERTICAL fov (MuJoCo convention); UE's FOVAngle is
+	// HORIZONTAL. Convert through the RT aspect so the rendered vertical
+	// fov equals fovy — consumers unprojecting with fovy-as-vertical then
+	// reconstruct correct geometry. (Assigning fovy straight to FOVAngle
+	// renders the wrong frustum on any non-square RT: at 640x480/fovy=160
+	// the lateral scale error is the 4:3 aspect — the go1 lidar ghost-wall
+	// bug.)
+	if (fovy < 1.0f)
+	{
+		return 90.0f; // fovy unset — keep UE's default capture fov.
+	}
+	float AspectWH = 1.0f;
+	if (resolution.Num() >= 2 && resolution[0] > 0 && resolution[1] > 0)
+	{
+		AspectWH = static_cast<float>(resolution[0]) / static_cast<float>(resolution[1]);
+	}
+	const float SafeFovy = FMath::Min(fovy, 175.0f);
+	const float HalfVertTan = FMath::Tan(FMath::DegreesToRadians(SafeFovy) * 0.5f);
+	const float HFovDeg = 2.0f * FMath::RadiansToDegrees(FMath::Atan(HalfVertTan * AspectWH));
+	return FMath::Clamp(HFovDeg, 1.0f, 175.0f);
 }
 
 void UMjCamera::BeginPlay()
@@ -343,6 +407,7 @@ void UMjCamera::BeginDestroy()
 			}
 		}
 	}
+	GCamTxProbes.Remove(FObjectKey(this));
 	Super::BeginDestroy();
 }
 
@@ -379,12 +444,25 @@ void UMjCamera::TickComponent(float DeltaTime, ELevelTick TickType,
 	if (bReadbackPending && ReadbackFence.IsFenceComplete())
 	{
 		bReadbackPending = false;
+
+		// Per-frame wire metadata: pose provenance latched at
+		// RequestReadback plus the RT dimensions.
+		FMjCameraFrameMeta FrameMeta;
+		FrameMeta.FrameId = PendingMetaFrameId;
+		FrameMeta.SimTime = PendingMetaSimTime;
+		FrameMeta.CaptureUnixTime = PendingMetaCaptureUnix;
+		if (RenderTarget)
+		{
+			FrameMeta.Width = static_cast<uint32>(RenderTarget->SizeX);
+			FrameMeta.Height = static_cast<uint32>(RenderTarget->SizeY);
+		}
+
 		if (PendingPixels.IsSet())
 		{
 			if (bEnableZmqBroadcast && ZmqWorker)
-				ZmqWorker->PushFrame(PendingPixels.GetValue());
+				ZmqWorker->PushFrame(FrameMeta, PendingPixels.GetValue());
 			if (bEnableShmBroadcast && ShmWriter)
-				ShmWriter->PushFrame(PendingPixels.GetValue());
+				ShmWriter->PushFrame(FrameMeta, PendingPixels.GetValue());
 			{
 				FScopeLock Lock(&FrameLock);
 				ReadyPixels.Emplace(MoveTemp(PendingPixels.GetValue()));
@@ -394,9 +472,33 @@ void UMjCamera::TickComponent(float DeltaTime, ELevelTick TickType,
 		if (PendingFloatPixels.IsSet())
 		{
 			if (bEnableZmqBroadcast && ZmqWorker)
-				ZmqWorker->PushFrame(PendingFloatPixels.GetValue());
+				ZmqWorker->PushFrame(FrameMeta, PendingFloatPixels.GetValue());
 			if (bEnableShmBroadcast && ShmWriter)
-				ShmWriter->PushFrame(PendingFloatPixels.GetValue());
+				ShmWriter->PushFrame(FrameMeta, PendingFloatPixels.GetValue());
+			// [camtx] Depth push probe: readback latency + pose slip between
+			// readback request and this push, plus a wall-clock stamp the
+			// WSL-side [camrx] log can line up against.
+			if (UE_LOG_ACTIVE(LogURLabNet, Verbose))
+			{
+				FCamTxProbe& Probe = GCamTxProbes.FindOrAdd(FObjectKey(this));
+				++Probe.PushSeq;
+				FVector PushPos = FVector::ZeroVector;
+				float PushYawDeg = 0.0f;
+				if (CaptureComponent)
+				{
+					const FTransform ProbeXf = CaptureComponent->GetComponentTransform();
+					PushPos = ProbeXf.GetLocation();
+					PushYawDeg = ProbeXf.Rotator().Yaw;
+				}
+				UE_LOG(LogURLabNet, Verbose,
+					TEXT("[camtx] cam=%s depth seq=%llu wall_unix=%.6f sim_t=%.4f frame_id=%llu readback_ms=%.1f slip_cm=%.2f slip_yaw_deg=%.3f pos_cm=(%.1f,%.1f,%.1f)"),
+					*MjName, Probe.PushSeq, CamTxUnixNowSec(),
+					FrameMeta.SimTime, FrameMeta.FrameId,
+					(FPlatformTime::Seconds() - Probe.ReqTimeSec) * 1000.0,
+					FVector::Dist(PushPos, Probe.ReqPos),
+					FMath::FindDeltaAngleDegrees(Probe.ReqYawDeg, PushYawDeg),
+					PushPos.X, PushPos.Y, PushPos.Z);
+			}
 			{
 				FScopeLock Lock(&FrameLock);
 				ReadyFloatPixels.Emplace(MoveTemp(PendingFloatPixels.GetValue()));
@@ -634,7 +736,7 @@ void UMjCamera::SetStreamingEnabled(bool bEnable)
 		}
 		if (CaptureComponent)
 		{
-			CaptureComponent->FOVAngle = fovy;
+			CaptureComponent->FOVAngle = ComputeHorizontalFovDeg();
 
 			// CRITICAL: SetVisibility(true) must be called to allow the component
 			// to dispatch scene capture updates. bHiddenInGame alone is not sufficient —
@@ -644,6 +746,18 @@ void UMjCamera::SetStreamingEnabled(bool bEnable)
 			CaptureComponent->bHiddenInGame = false;
 			CaptureComponent->bCaptureEveryFrame = true;
 			CaptureComponent->bCaptureOnMovement = false; // We drive capture manually each tick
+
+			// [caminfo] One line per stream enable: everything a consumer
+			// needs to unproject this camera correctly. FOVAngle is DERIVED
+			// from fovy (vertical, MuJoCo convention) through the RT aspect
+			// so the rendered vertical fov equals fovy exactly.
+			UE_LOG(LogURLabNet, Log,
+				TEXT("[caminfo] cam=%s mode=%s res=%dx%d fovy_mjcf_vertical=%.2f ue_FOVAngle_horizontal=%.2f near_cm=%.1f far_cm=%.1f"),
+				*MjName, *UEnum::GetValueAsString(CaptureMode),
+				resolution.Num() > 0 ? resolution[0] : 0,
+				resolution.Num() > 1 ? resolution[1] : 0,
+				fovy, CaptureComponent->FOVAngle,
+				DepthNearCm, DepthFarCm);
 		}
 		bStreamingEnabled = true;
 		RegisterWithStreamingManager();
@@ -743,6 +857,26 @@ void UMjCamera::RequestReadback()
 	TArray<FColor>* PixelsPtr = nullptr;
 	TArray<float>* FloatPtr = nullptr;
 	bReadbackPending = true;
+
+	// Latch the frame's wire metadata: the render state applied this frame
+	// is what the capture (and thus this readback) will show.
+	PendingMetaSimTime = LastRenderSimTime;
+	PendingMetaFrameId = LastRenderFrameId;
+	PendingMetaCaptureUnix = CamTxUnixNowSec();
+
+	// [camtx] Stamp request time + camera pose; the depth-push log reports
+	// how long the readback took and how far the camera moved meanwhile.
+	if (CaptureMode == EMjCameraMode::Depth && UE_LOG_ACTIVE(LogURLabNet, Verbose))
+	{
+		FCamTxProbe& Probe = GCamTxProbes.FindOrAdd(FObjectKey(this));
+		Probe.ReqTimeSec = FPlatformTime::Seconds();
+		if (CaptureComponent)
+		{
+			const FTransform ProbeXf = CaptureComponent->GetComponentTransform();
+			Probe.ReqPos = ProbeXf.GetLocation();
+			Probe.ReqYawDeg = ProbeXf.Rotator().Yaw;
+		}
+	}
 	if (CaptureMode == EMjCameraMode::Depth)
 	{
 		PendingFloatPixels.Emplace();
@@ -837,6 +971,129 @@ FString UMjCamera::GetActualZmqEndpoint() const
 // ---------------------------------------------------------------------------
 // ExportTo
 // ---------------------------------------------------------------------------
+
+void UMjCamera::RegisterToSpec(FMujocoSpecWrapper& Wrapper, mjsBody* ParentBody)
+{
+	if (!ParentBody)
+	{
+		return;
+	}
+
+	mjsCamera* Camera = mjs_addCamera(ParentBody, nullptr);
+	if (!Camera)
+	{
+		UE_LOG(LogURLabImport, Warning,
+			TEXT("[MjCamera] '%s' mjs_addCamera failed; runtime pose sync will be unavailable."),
+			*GetName());
+		return;
+	}
+
+	m_SpecElement = Camera->element;
+	SetSpecElementName(Wrapper, Camera->element, mjOBJ_CAMERA);
+	ExportTo(Camera, nullptr);
+}
+
+void UMjCamera::Bind(mjModel* model, mjData* data, const FString& Prefix)
+{
+	Super::Bind(model, data, Prefix);
+	RuntimeCameraId = -1;
+
+	if (!m_Model)
+	{
+		return;
+	}
+
+	TArray<FString> CandidateNames;
+	auto AddCandidate = [&CandidateNames](const FString& Name) {
+		if (!Name.IsEmpty())
+		{
+			CandidateNames.AddUnique(Name);
+		}
+	};
+
+	AddCandidate(MjName);
+	AddCandidate(OriginalMjName);
+	AddCandidate(GetName());
+
+	for (const FString& Candidate : CandidateNames)
+	{
+		const FString PrefixedName = Prefix + Candidate;
+		const int32 Id = mj_name2id(m_Model, mjOBJ_CAMERA, TCHAR_TO_UTF8(*PrefixedName));
+		if (Id >= 0)
+		{
+			RuntimeCameraId = Id;
+			m_ID = Id;
+			UE_LOG(LogURLabBind, Log,
+				TEXT("[MjCamera] '%s' bound camera id=%d via '%s'."),
+				*GetName(), Id, *PrefixedName);
+			return;
+		}
+	}
+
+	for (const FString& Candidate : CandidateNames)
+	{
+		const int32 Id = mj_name2id(m_Model, mjOBJ_CAMERA, TCHAR_TO_UTF8(*Candidate));
+		if (Id >= 0)
+		{
+			RuntimeCameraId = Id;
+			m_ID = Id;
+			UE_LOG(LogURLabBind, Log,
+				TEXT("[MjCamera] '%s' bound camera id=%d via bare name '%s'."),
+				*GetName(), Id, *Candidate);
+			return;
+		}
+	}
+
+	if (m_SpecElement)
+	{
+		const int32 SpecId = mjs_getId(m_SpecElement);
+		if (SpecId >= 0 && SpecId < m_Model->ncam)
+		{
+			RuntimeCameraId = SpecId;
+			m_ID = SpecId;
+			UE_LOG(LogURLabBind, Warning,
+				TEXT("[MjCamera] '%s' fell back to spec camera id=%d after all compiled-name lookups failed."),
+				*GetName(), SpecId);
+			return;
+		}
+	}
+
+	UE_LOG(LogURLabBind, Warning,
+		TEXT("[MjCamera] '%s' failed to bind compiled camera id (Prefix='%s', MjName='%s', Original='%s')."),
+		*GetName(), *Prefix, *MjName, *OriginalMjName);
+}
+
+void UMjCamera::ApplyRenderState(const FMjRenderSnapshot& Snap)
+{
+	if (RuntimeCameraId < 0)
+	{
+		return;
+	}
+
+	const int32 PosIdx = RuntimeCameraId * 3;
+	const int32 MatIdx = RuntimeCameraId * 9;
+	if (Snap.CamXPos.Num() <= PosIdx + 2 || Snap.CamXMat.Num() <= MatIdx + 8)
+	{
+		UE_LOG(LogURLabBind, Warning,
+			TEXT("[MjCamera] '%s' camera id=%d out of render snapshot range (CamXPos=%d, CamXMat=%d). Disabling pose sync."),
+			*GetName(), RuntimeCameraId, Snap.CamXPos.Num(), Snap.CamXMat.Num());
+		RuntimeCameraId = -1;
+		m_ID = -1;
+		return;
+	}
+
+	double MjQuat[4] = {1.0, 0.0, 0.0, 0.0};
+	mju_mat2Quat(MjQuat, &Snap.CamXMat[MatIdx]);
+
+	const FVector MuJoCoWorldPos = MjUtils::MjToUEPosition(&Snap.CamXPos[PosIdx]);
+	const FQuat MuJoCoWorldQuat = MjUtils::MjToUERotation(MjQuat);
+	SetWorldLocationAndRotation(MuJoCoWorldPos, MuJoCoWorldQuat);
+
+	// Record which physics snapshot this pose came from; RequestReadback
+	// latches it for the frame in flight (FMjCameraFrameMeta).
+	LastRenderSimTime = static_cast<double>(Snap.SimTime);
+	LastRenderFrameId = Snap.FrameId;
+}
 
 void UMjCamera::ExportTo(mjsCamera* Element, mjsDefault* /*def*/)
 {
@@ -1054,6 +1311,6 @@ void UMjCamera::ImportFromXml(const FXmlNode* Node, const FMjCompilerSettings& C
 
 	if (CaptureComponent)
 	{
-		CaptureComponent->FOVAngle = fovy;
+		CaptureComponent->FOVAngle = ComputeHorizontalFovDeg();
 	}
 }

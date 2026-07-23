@@ -29,6 +29,7 @@
 #include "HAL/Runnable.h"
 #include "HAL/ThreadSafeBool.h"
 #include "Containers/Queue.h"
+#include "MuJoCo/Components/Sensors/MjCameraFrameMeta.h"
 #include "MuJoCo/Components/Sensors/MjCameraTypes.h"
 #include "MuJoCo/Utils/MjOrientationUtils.h"
 #include <atomic>
@@ -49,8 +50,8 @@ public:
 	virtual void Stop() override;
 	virtual void Exit() override;
 
-	void PushFrame(const TArray<FColor>& FrameData);
-	void PushFrame(const TArray<float>& FrameData);
+	void PushFrame(const FMjCameraFrameMeta& Meta, const TArray<FColor>& FrameData);
+	void PushFrame(const FMjCameraFrameMeta& Meta, const TArray<float>& FrameData);
 	FString GetBoundEndpoint() const { return BoundEndpoint; }
 
 	/** Process-wide pause gate. Workers drain without sending while set,
@@ -71,9 +72,10 @@ private:
 	// FColor queue, depth cameras drive the float queue. The Run() loop
 	// drains both and ships whatever it finds. Per-camera CaptureMode
 	// never changes after streaming starts, so only one queue is ever
-	// active per worker instance.
-	TQueue<TArray<FColor>, EQueueMode::Spsc> FrameQueue;
-	TQueue<TArray<float>, EQueueMode::Spsc> FloatFrameQueue;
+	// active per worker instance. Each entry carries its FMjCameraFrameMeta
+	// so the wire payload is [meta][pixels].
+	TQueue<TPair<FMjCameraFrameMeta, TArray<FColor>>, EQueueMode::Spsc> FrameQueue;
+	TQueue<TPair<FMjCameraFrameMeta, TArray<float>>, EQueueMode::Spsc> FloatFrameQueue;
 };
 
 /**
@@ -85,7 +87,8 @@ private:
  * SetStreamingEnabled(true) is called.
  *
  * Key design points:
- *  - No ExportTo / RegisterToSpec — camera is UE-side only, not fed back to MuJoCo.
+ *  - RegisterToSpec exports the camera so MuJoCo computes fixed/track camera poses.
+ *  - Bind resolves the compiled camera id; ApplyRenderState consumes cam_xpos/cam_xmat.
  *  - SetStreamingEnabled() allocates the RT and calls IStreamingManager::AddViewInformation
  *    so textures load correctly even when the player pawn is far away.
  *  - RequestReadback() enqueues a non-blocking GPU→CPU copy; check IsReadbackReady()
@@ -246,6 +249,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo|Camera|Network")
 	bool bEnableShmBroadcast = false;
 
+	/** @brief If true, the global "Enable All Cameras" streaming toggle
+	 *  skips this camera: it is never auto-enabled for capture/ZMQ/SHM
+	 *  broadcast (explicit SetStreamingEnabled still works). Set by the
+	 *  robot-profile automation for MJCF observer cameras (track/top/side/
+	 *  back) that no consumer reads — streaming them burns render time and
+	 *  bandwidth for nothing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo|Camera|Network")
+	bool bExcludeFromGlobalStreamingToggle = false;
+
 	// ---- Public API ----
 
 	/**
@@ -293,6 +305,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MuJoCo|Camera")
 	FString GetActualZmqEndpoint() const;
 
+	/** Horizontal capture FOV (deg) whose VERTICAL fov equals MJCF `fovy`
+	 *  at the render-target aspect ratio. MuJoCo's fovy is vertical while
+	 *  UE's FOVAngle is horizontal — assigning fovy straight to FOVAngle
+	 *  renders the wrong frustum on any non-square RT, so every FOVAngle
+	 *  write goes through this. */
+	float ComputeHorizontalFovDeg() const;
+
 	/**
 	 * @brief Returns the bound camera component pointer (for UI wiring).
 	 */
@@ -304,6 +323,9 @@ public:
 	 * @param cam Pointer to the target mjsCamera structure.
 	 * @param def Optional default structure (unused, kept for API consistency).
 	 */
+	virtual void RegisterToSpec(class FMujocoSpecWrapper& Wrapper, mjsBody* ParentBody = nullptr) override;
+	virtual void Bind(mjModel* model, mjData* data, const FString& Prefix = TEXT("")) override;
+	void ApplyRenderState(const struct FMjRenderSnapshot& Snap);
 	void ExportTo(mjsCamera* Element, mjsDefault* def = nullptr);
 
 	/**
@@ -325,6 +347,8 @@ private:
 	// ---- Internal helpers ----
 	void SetupRenderTarget();
 	void RegisterWithStreamingManager();
+
+	int32 RuntimeCameraId = -1;
 
 	/** True once this camera has been handed to UMjNetworkManager::RegisterCamera.
 	 *  MJCF-imported cameras never run BeginPlay (created via NewObject during
@@ -365,6 +389,17 @@ private:
 	FRenderCommandFence ReadbackFence;
 	bool bReadbackPending = false;
 	bool bReadbackComplete = false;
+
+	// ---- Frame-meta stamping (FMjCameraFrameMeta) ----
+	// ApplyRenderState records which physics snapshot the capture pose came
+	// from; RequestReadback latches it (plus the wall clock) for the frame
+	// in flight; TickComponent's push prepends it to the wire payload so
+	// consumers can pair pixels with the pose at capture time.
+	double LastRenderSimTime = 0.0;
+	uint64 LastRenderFrameId = 0;
+	double PendingMetaSimTime = 0.0;
+	uint64 PendingMetaFrameId = 0;
+	double PendingMetaCaptureUnix = 0.0;
 
 	// ---- Streaming state ----
 	bool bStreamingEnabled = false;

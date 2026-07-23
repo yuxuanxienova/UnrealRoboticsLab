@@ -15,6 +15,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "MuJoCo/Components/Sensors/MjCameraFrameMeta.h"
 #include "Transport/ShmRegion.h"
 
 /**
@@ -27,8 +28,10 @@
  * background thread -- the camera readback callback feeds this directly
  * on the game / render-thread sidecar.
  *
- * Wire layout per slot: `[u32 size][bytes...]`. The byte format depends
- * on the camera mode and is documented out-of-band via the handshake:
+ * Wire layout per slot: `[u32 size][FMjCameraFrameMeta][pixels]` where
+ * `size` covers meta + pixels (urlab_client's parse_camera_frame splits
+ * them). The pixel format depends on the camera mode and is documented
+ * out-of-band via the handshake:
  *  - Real: width * height * 4 bytes BGRA8 (FColor).
  *  - Depth: width * height * 4 bytes float32 (single channel).
  *  - Semantic / Instance: width * height * 4 bytes BGRA8 with a
@@ -52,21 +55,21 @@ public:
 
 	bool IsOpen() const { return Region.IsOpen(); }
 
-	/** Push one frame's raw bytes. Silently drops if `ByteCount` doesn't
-	 *  match the configured pixel count * 4 -- a partial frame can't be
-	 *  decoded by the consumer anyway. */
-	void PushFrame(const void* Data, uint32 ByteCount);
+	/** Push one frame: `[meta][pixels]` into the next slot. Silently drops
+	 *  if `ByteCount` doesn't match the configured pixel count * 4 -- a
+	 *  partial frame can't be decoded by the consumer anyway. */
+	void PushFrame(const FMjCameraFrameMeta& Meta, const void* Data, uint32 ByteCount);
 
 	/** Convenience overload for color frames. */
-	void PushFrame(const TArray<FColor>& Pixels)
+	void PushFrame(const FMjCameraFrameMeta& Meta, const TArray<FColor>& Pixels)
 	{
-		PushFrame(Pixels.GetData(), static_cast<uint32>(Pixels.Num()) * sizeof(FColor));
+		PushFrame(Meta, Pixels.GetData(), static_cast<uint32>(Pixels.Num()) * sizeof(FColor));
 	}
 
 	/** Convenience overload for single-channel float frames (depth). */
-	void PushFrame(const TArray<float>& Pixels)
+	void PushFrame(const FMjCameraFrameMeta& Meta, const TArray<float>& Pixels)
 	{
-		PushFrame(Pixels.GetData(), static_cast<uint32>(Pixels.Num()) * sizeof(float));
+		PushFrame(Meta, Pixels.GetData(), static_cast<uint32>(Pixels.Num()) * sizeof(float));
 	}
 
 	FString GetPath() const { return Region.GetPath(); }

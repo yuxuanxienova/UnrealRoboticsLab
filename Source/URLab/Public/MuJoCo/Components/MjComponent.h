@@ -90,6 +90,8 @@ public:
 				return M->ngeom;
 			case mjOBJ_SITE:
 				return M->nsite;
+			case mjOBJ_CAMERA:
+				return M->ncam;
 			case mjOBJ_ACTUATOR:
 				return M->nu;
 			case mjOBJ_SENSOR:

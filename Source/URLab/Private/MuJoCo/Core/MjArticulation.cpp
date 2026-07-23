@@ -46,6 +46,7 @@
 #include "MuJoCo/Components/Joints/MjJoint.h"
 #include "MuJoCo/Components/Geometry/MjSite.h"
 #include "MuJoCo/Components/Sensors/MjSensor.h"
+#include "MuJoCo/Components/Sensors/MjCamera.h"
 #include "MuJoCo/Components/Actuators/MjActuator.h"
 #include "MuJoCo/Components/Tendons/MjTendon.h"
 #include "MuJoCo/Components/Deformable/MjFlexcomp.h"
@@ -1095,6 +1096,16 @@ void AMjArticulation::ApplyRenderState(const FMjRenderSnapshot& Snap)
 		if (Body)
 		{
 			Body->ApplyRenderState(Snap);
+		}
+	}
+
+	TArray<UMjCamera*> Cameras;
+	GetRuntimeComponents<UMjCamera>(Cameras);
+	for (UMjCamera* Cam : Cameras)
+	{
+		if (Cam)
+		{
+			Cam->ApplyRenderState(Snap);
 		}
 	}
 }

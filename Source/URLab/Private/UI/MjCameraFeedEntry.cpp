@@ -77,8 +77,7 @@ void UMjCameraFeedEntry::RefreshBrush()
 			|| DepthPreviewTexture->GetSizeY() != BoundCamera->resolution[1])
 		{
 			DepthPreviewTexture = UTexture2D::CreateTransient(
-				BoundCamera->resolution[0], BoundCamera->resolution[1], PF_B8G8R8A8,
-				TEXT("URLabDepthPreview"));
+				BoundCamera->resolution[0], BoundCamera->resolution[1], PF_B8G8R8A8);
 			DepthPreviewTexture->CompressionSettings = TC_VectorDisplacementmap;
 			DepthPreviewTexture->SRGB = false;
 			DepthPreviewTexture->UpdateResource();

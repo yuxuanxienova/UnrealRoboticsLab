@@ -510,9 +510,17 @@ void UMjCamera::TickComponent(float DeltaTime, ELevelTick TickType,
 
 	// Always refresh PendingPixels while streaming; include_cameras consumes it
 	// without enabling ZMQ/SHM broadcast (those flags only gate the workers below).
+	// StreamMaxHz (0 = uncapped) rate-limits the automatic readback: full
+	// editor-rate 640x480 float32 per camera saturates the bridge when the
+	// consumer only needs a few Hz.
 	if (bStreamingEnabled && !bReadbackPending)
 	{
-		RequestReadback();
+		const bool bDue = StreamMaxHz <= 0.0f
+			|| (FPlatformTime::Seconds() - LastAutoReadbackRequestSec) >= (1.0 / static_cast<double>(StreamMaxHz));
+		if (bDue)
+		{
+			RequestReadback();
+		}
 	}
 }
 
@@ -858,11 +866,23 @@ void UMjCamera::RequestReadback()
 	TArray<float>* FloatPtr = nullptr;
 	bReadbackPending = true;
 
-	// Latch the frame's wire metadata: the render state applied this frame
-	// is what the capture (and thus this readback) will show.
-	PendingMetaSimTime = LastRenderSimTime;
-	PendingMetaFrameId = LastRenderFrameId;
-	PendingMetaCaptureUnix = CamTxUnixNowSec();
+	// Latch the frame's wire metadata. The pixels this readback returns
+	// were rendered from the PREVIOUS applied render state (the readback
+	// render command runs before this frame's capture), so stamp with the
+	// Prev* latch; fall back to Last*/now before two states have applied.
+	LastAutoReadbackRequestSec = FPlatformTime::Seconds();
+	if (PrevRenderFrameId != 0)
+	{
+		PendingMetaSimTime = PrevRenderSimTime;
+		PendingMetaFrameId = PrevRenderFrameId;
+		PendingMetaCaptureUnix = PrevRenderWallUnix;
+	}
+	else
+	{
+		PendingMetaSimTime = LastRenderSimTime;
+		PendingMetaFrameId = LastRenderFrameId;
+		PendingMetaCaptureUnix = LastRenderWallUnix > 0.0 ? LastRenderWallUnix : CamTxUnixNowSec();
+	}
 
 	// [camtx] Stamp request time + camera pose; the depth-push log reports
 	// how long the readback took and how far the camera moved meanwhile.
@@ -1089,10 +1109,16 @@ void UMjCamera::ApplyRenderState(const FMjRenderSnapshot& Snap)
 	const FQuat MuJoCoWorldQuat = MjUtils::MjToUERotation(MjQuat);
 	SetWorldLocationAndRotation(MuJoCoWorldPos, MuJoCoWorldQuat);
 
-	// Record which physics snapshot this pose came from; RequestReadback
-	// latches it for the frame in flight (FMjCameraFrameMeta).
+	// 1-deep history of which physics snapshot this pose came from. The
+	// readback enqueued from TickComponent executes on the render thread
+	// BEFORE this frame's scene capture renders, so its pixels show the
+	// PREVIOUS applied state — RequestReadback stamps with Prev*.
+	PrevRenderSimTime = LastRenderSimTime;
+	PrevRenderFrameId = LastRenderFrameId;
+	PrevRenderWallUnix = LastRenderWallUnix;
 	LastRenderSimTime = static_cast<double>(Snap.SimTime);
 	LastRenderFrameId = Snap.FrameId;
+	LastRenderWallUnix = CamTxUnixNowSec();
 }
 
 void UMjCamera::ExportTo(mjsCamera* Element, mjsDefault* /*def*/)

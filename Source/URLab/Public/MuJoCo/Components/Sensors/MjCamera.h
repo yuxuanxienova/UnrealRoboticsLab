@@ -221,6 +221,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo|Camera|Streaming")
 	float StreamingBoost = 1.0f;
 
+	/** @brief Max automatic readback/stream rate in Hz (0 = every editor
+	 *  frame). Producing 640x480 float32 at full editor rate per camera
+	 *  saturates the bridge when consumers only need a few Hz; the go1
+	 *  robot profile caps its lidar depth cameras at ~10 Hz. Explicit
+	 *  RequestReadback calls (bridge Sync mode) bypass the cap. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MuJoCo|Camera|Streaming", meta = (ClampMin = "0.0"))
+	float StreamMaxHz = 0.0f;
+
 	// ---- Capture Components ----
 
 	/** @brief The underlying SceneCaptureComponent2D. Capture is disabled by default. */
@@ -391,15 +399,27 @@ private:
 	bool bReadbackComplete = false;
 
 	// ---- Frame-meta stamping (FMjCameraFrameMeta) ----
-	// ApplyRenderState records which physics snapshot the capture pose came
-	// from; RequestReadback latches it (plus the wall clock) for the frame
-	// in flight; TickComponent's push prepends it to the wire payload so
-	// consumers can pair pixels with the pose at capture time.
+	// ApplyRenderState keeps a 1-deep history of which physics snapshot the
+	// capture pose came from. The readback enqueued from TickComponent runs
+	// on the render thread BEFORE this frame's scene capture renders, so
+	// the pixels it returns show the PREVIOUS applied state —
+	// RequestReadback therefore stamps frames with the Prev* latch.
+	// (Stamping with Last* re-creates rotation ghosting: at a
+	// background-throttled 3fps editor the stamp leads the content by
+	// 333ms, which at 90deg/s of yaw is ~30deg of wall misregistration.)
 	double LastRenderSimTime = 0.0;
 	uint64 LastRenderFrameId = 0;
+	double LastRenderWallUnix = 0.0;
+	double PrevRenderSimTime = 0.0;
+	uint64 PrevRenderFrameId = 0;
+	double PrevRenderWallUnix = 0.0;
 	double PendingMetaSimTime = 0.0;
 	uint64 PendingMetaFrameId = 0;
 	double PendingMetaCaptureUnix = 0.0;
+
+	/** Wall seconds (FPlatformTime) of the last automatic readback request;
+	 *  drives the StreamMaxHz rate limit. */
+	double LastAutoReadbackRequestSec = 0.0;
 
 	// ---- Streaming state ----
 	bool bStreamingEnabled = false;

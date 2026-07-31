@@ -727,6 +727,8 @@ void UMujocoGenerationAction::ImportNodeRecursive(const FXmlNode* Node, USCS_Nod
 
 				if (MaterialInstance)
 				{
+					GeomComp->OverrideMaterial = MaterialInstance;
+					GeomComp->ApplyOverrideMaterial(MaterialInstance);
 					BuiltInViz->SetMaterial(0, MaterialInstance);
 				}
 

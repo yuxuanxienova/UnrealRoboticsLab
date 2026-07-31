@@ -24,6 +24,8 @@
 #include "MjEditorStyle.h"
 #include "MjBridgeServerSubsystem.h"
 #include "MjEditorOpHandlers.h"
+#include "MjLevelOps.h"
+#include "MjPythonHelper.h"
 #include "Bridge/BridgeServerProvider.h"
 #include "SMjStepModeIndicator.h"
 #include "SMjBridgeServerToggle.h"
@@ -33,6 +35,14 @@
 #include "ToolMenuEntry.h"
 #include "ToolMenuSection.h"
 #include "ToolMenuMisc.h"
+#include "DesktopPlatformModule.h"
+#include "Framework/Application/SlateApplication.h"
+#include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/MessageDialog.h"
+#include "Misc/Paths.h"
+#include "UObject/UObjectGlobals.h"
 
 DEFINE_LOG_CATEGORY(LogURLabEditor);
 #include "PropertyEditorModule.h"
@@ -63,6 +73,62 @@ DEFINE_LOG_CATEGORY(LogURLabEditor);
 #include "SMjArticulationOutliner.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Framework/Docking/WorkspaceItem.h"
+
+namespace
+{
+FString ExtractWrittenMjcfPath(const FString& StdOut)
+{
+	TArray<FString> Lines;
+	StdOut.ParseIntoArrayLines(Lines);
+	for (int32 Index = Lines.Num() - 1; Index >= 0; --Index)
+	{
+		FString Line = Lines[Index].TrimStartAndEnd();
+		const FString Prefix = TEXT("Wrote MJCF to ");
+		if (Line.StartsWith(Prefix))
+		{
+			return Line.Mid(Prefix.Len()).TrimStartAndEnd();
+		}
+	}
+	return FString();
+}
+
+FString ResolveDefaultArticraftUrdfDirectory()
+{
+	TArray<FString> CandidateDirs;
+
+	const FString DataRoot = FPlatformMisc::GetEnvironmentVariable(TEXT("ARTICRAFT_DATA_ROOT"));
+	if (!DataRoot.IsEmpty())
+	{
+		CandidateDirs.Add(FPaths::ConvertRelativePathToFull(
+			DataRoot / TEXT("cache") / TEXT("record_materialization")));
+	}
+
+	const FString UserName = FPlatformProcess::UserName(/*bOnlyAlphaNumeric=*/false);
+	if (!UserName.IsEmpty())
+	{
+		CandidateDirs.Add(FString::Printf(
+			TEXT("\\\\wsl.localhost\\Ubuntu-24.04\\home\\%s\\projects\\articraft\\data\\cache\\record_materialization"),
+			*UserName));
+		CandidateDirs.Add(FString::Printf(
+			TEXT("\\\\wsl$\\Ubuntu-24.04\\home\\%s\\projects\\articraft\\data\\cache\\record_materialization"),
+			*UserName));
+		CandidateDirs.Add(FPaths::ConvertRelativePathToFull(
+			FPaths::Combine(
+				FPlatformProcess::UserDir(),
+				TEXT("projects/articraft/data/cache/record_materialization"))));
+	}
+
+	for (const FString& Candidate : CandidateDirs)
+	{
+		if (FPaths::DirectoryExists(Candidate))
+		{
+			return Candidate;
+		}
+	}
+
+	return FPaths::ProjectDir();
+}
+} // namespace
 
 void FURLabEditorModule::StartupModule()
 {
@@ -124,6 +190,18 @@ void FURLabEditorModule::StartupModule()
 	// every 0.5s and shows a coloured pill: green=Live, amber=Direct,
 	// blue=Puppet, grey=Auto/none. No asset deps; pure code.
 	UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateLambda([]() {
+		UToolMenu* ToolsMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.MainMenu.Tools");
+		if (ToolsMenu)
+		{
+			FToolMenuSection& URLabMenuSection = ToolsMenu->FindOrAddSection("URLab");
+			URLabMenuSection.AddMenuEntry(
+				"URLabImportArticraftUrdf",
+				FText::FromString(TEXT("Import Articraft URDF...")),
+				FText::FromString(TEXT("Convert an Articraft URDF to MJCF and import it as a MuJoCo articulation Blueprint.")),
+				FSlateIcon(),
+				FUIAction(FExecuteAction::CreateStatic(&FURLabEditorModule::ImportArticraftUrdf)));
+		}
+
 		UToolMenu* ToolBar = UToolMenus::Get()->ExtendMenu("LevelEditor.LevelEditorToolBar.PlayToolBar");
 		if (!ToolBar)
 			return;
@@ -216,6 +294,161 @@ TSharedRef<FExtender> FURLabEditorModule::OnExtendActorContextMenu(
 	}
 
 	return Extender;
+}
+
+void FURLabEditorModule::ImportArticraftUrdf()
+{
+	TArray<FString> SelectedFiles;
+	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
+	if (!DesktopPlatform)
+	{
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(TEXT("Could not open the system file picker.")),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	DesktopPlatform->OpenFileDialog(
+		FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr),
+		TEXT("Select Articraft URDF"),
+		ResolveDefaultArticraftUrdfDirectory(),
+		TEXT("model.urdf"),
+		TEXT("URDF Files (*.urdf)|*.urdf|All Files (*.*)|*.*"),
+		0,
+		SelectedFiles);
+
+	if (SelectedFiles.Num() == 0)
+	{
+		return;
+	}
+
+	const FString UrdfPath = FPaths::ConvertRelativePathToFull(SelectedFiles[0]);
+	if (!FPaths::FileExists(UrdfPath))
+	{
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(FString::Printf(TEXT("URDF file not found:\n%s"), *UrdfPath)),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("UnrealRoboticsLab"));
+	if (!Plugin.IsValid())
+	{
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(TEXT("Could not find the UnrealRoboticsLab plugin.")),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	const FString ScriptPath = FPaths::ConvertRelativePathToFull(
+		Plugin->GetBaseDir() / TEXT("Scripts") / TEXT("articraft_urdf_to_mjcf.py"));
+	if (!FPaths::FileExists(ScriptPath))
+	{
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(FString::Printf(TEXT("Converter script not found:\n%s"), *ScriptPath)),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	const FString OutputDir = FPaths::ConvertRelativePathToFull(
+		FPaths::ProjectDir() / TEXT("MJCF") / TEXT("articraft"));
+	IFileManager::Get().MakeDirectory(*OutputDir, /*Tree=*/true);
+
+	const FString PythonPath = FMjPythonHelper::ResolvePythonPath();
+	if (!FMjPythonHelper::ValidatePythonBinary(PythonPath))
+	{
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(FString::Printf(TEXT("Could not run Python interpreter:\n%s"), *PythonPath)),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	const FString Args = FString::Printf(
+		TEXT("\"%s\" \"%s\" --output-dir \"%s\""),
+		*ScriptPath,
+		*UrdfPath,
+		*OutputDir);
+
+	int32 ReturnCode = -1;
+	FString StdOut;
+	FString StdErr;
+	UE_LOG(LogURLabEditor, Log, TEXT("Running Articraft URDF conversion: %s %s"), *PythonPath, *Args);
+	FPlatformProcess::ExecProcess(*PythonPath, *Args, &ReturnCode, &StdOut, &StdErr);
+	if (ReturnCode != 0)
+	{
+		UE_LOG(LogURLabEditor, Error, TEXT("Articraft URDF conversion failed (code %d): %s"), ReturnCode, *StdErr);
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(FString::Printf(
+				TEXT("Articraft URDF conversion failed.\n\nCommand:\n%s %s\n\nError:\n%s"),
+				*PythonPath,
+				*Args,
+				*StdErr)),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	const FString ReportedMjcfPath = ExtractWrittenMjcfPath(StdOut);
+	const FString MjcfPath = ReportedMjcfPath.IsEmpty()
+								 ? FString()
+								 : FPaths::ConvertRelativePathToFull(ReportedMjcfPath);
+	if (MjcfPath.IsEmpty() || !FPaths::FileExists(MjcfPath))
+	{
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(FString::Printf(
+				TEXT("Converter finished but did not report a valid MJCF path.\n\nOutput:\n%s\n\nError:\n%s"),
+				*StdOut,
+				*StdErr)),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	FString BlueprintClassPath;
+	FString BlueprintShortName;
+	bool bImportedNow = false;
+	FString ImportError;
+	if (!URLabLevelOps::ImportXmlSync(
+			MjcfPath,
+			/*bForceReimport=*/true,
+			BlueprintClassPath,
+			BlueprintShortName,
+			bImportedNow,
+			ImportError))
+	{
+		FMessageDialog::Open(
+			EAppMsgType::Ok,
+			FText::FromString(FString::Printf(
+				TEXT("Converted MJCF, but URLab could not import it.\n\nMJCF:\n%s\n\nError:\n%s"),
+				*MjcfPath,
+				*ImportError)),
+			FText::FromString(TEXT("Import Articraft URDF")));
+		return;
+	}
+
+	const FString BlueprintObjectPath = FString::Printf(
+		TEXT("/Game/MuJoCoImports/%s.%s"),
+		*BlueprintShortName,
+		*BlueprintShortName);
+	if (UObject* ImportedAsset = StaticLoadObject(UObject::StaticClass(), nullptr, *BlueprintObjectPath))
+	{
+		TArray<UObject*> ObjectsToSync;
+		ObjectsToSync.Add(ImportedAsset);
+		GEditor->SyncBrowserToObjects(ObjectsToSync);
+	}
+
+	FMessageDialog::Open(
+		EAppMsgType::Ok,
+		FText::FromString(FString::Printf(
+			TEXT("Imported Articraft URDF as a URLab MuJoCo Blueprint.\n\nMJCF:\n%s\n\nBlueprint:\n/Game/MuJoCoImports/%s"),
+			*MjcfPath,
+			*BlueprintShortName)),
+		FText::FromString(TEXT("Import Articraft URDF")));
 }
 
 void FURLabEditorModule::BuildQuickConvertSubMenu(FMenuBuilder& MenuBuilder, TArray<AActor*> SelectedActors)

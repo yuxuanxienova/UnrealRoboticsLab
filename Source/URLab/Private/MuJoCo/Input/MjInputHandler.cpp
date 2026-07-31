@@ -265,48 +265,27 @@ void UMjInputHandler::ProcessPerturbation(APlayerController* PC, float DeltaTime
 	Pert->ClickCamRight = CamBasis.GetScaledAxis(EAxis::Y);
 	Pert->ClickCamUp = CamBasis.GetScaledAxis(EAxis::Z);
 
-	const bool bCtrl = PC->IsInputKeyDown(EKeys::LeftControl) || PC->IsInputKeyDown(EKeys::RightControl);
 	const bool bLmbDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
 	const bool bRmbDown = PC->IsInputKeyDown(EKeys::RightMouseButton);
+	const bool bPlainLmbHeld = bLmbDown && !bRmbDown;
 
-	// Double-click LMB: select body.
-	if (!bCtrl && PC->WasInputKeyJustPressed(EKeys::LeftMouseButton))
+	// LMB press on a MuJoCo body: select and immediately start translate perturbation.
+	if (bPlainLmbHeld && !bPrevPlainLmbHeld)
 	{
-		const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
-		constexpr float kDoubleClickWindowS = 0.35f;
-		if (Now - LastLMBPressTime < kDoubleClickWindowS)
+		Pert->HandleSelect(CursorOrigin, CursorDirection);
+		if (Pert->HasSelection())
 		{
-			Pert->HandleSelect(CursorOrigin, CursorDirection);
-			LastLMBPressTime = -1.0f;
+			Pert->StartTranslate(CursorOrigin, CursorDirection);
+			LockCamera(PC);
+
+			float MX = 0.f, MY = 0.f;
+			PC->GetMousePosition(MX, MY);
+			TranslateClickScreen = FVector2D(MX, MY);
+			TranslateAccumPixels = FVector2D::ZeroVector;
 		}
-		else
-		{
-			LastLMBPressTime = Now;
-		}
 	}
 
-	// ctrl+LMB press edge: start rotate.
-	const bool bCtrlLmbHeld = bCtrl && bLmbDown;
-	if (bCtrlLmbHeld && !bPrevCtrlLmbHeld && Pert->HasSelection())
-	{
-		Pert->StartRotate();
-		LockCamera(PC);
-	}
-
-	// ctrl+RMB press edge: start translate.
-	const bool bCtrlRmbHeld = bCtrl && bRmbDown;
-	if (bCtrlRmbHeld && !bPrevCtrlRmbHeld && Pert->HasSelection())
-	{
-		Pert->StartTranslate(CursorOrigin, CursorDirection);
-		LockCamera(PC);
-
-		float MX = 0.f, MY = 0.f;
-		PC->GetMousePosition(MX, MY);
-		TranslateClickScreen = FVector2D(MX, MY);
-		TranslateAccumPixels = FVector2D::ZeroVector;
-	}
-
-	if (Pert->IsDragging() && (bCtrlLmbHeld || bCtrlRmbHeld))
+	if (Pert->IsDragging() && bPlainLmbHeld)
 	{
 		FVector2D RawDelta = FVector2D::ZeroVector;
 		if (MouseDeltaProcessor.IsValid())
@@ -318,21 +297,17 @@ void UMjInputHandler::ProcessPerturbation(APlayerController* PC, float DeltaTime
 		PC->GetViewportSize(Vw, Vh);
 		const float InvH = Vh > 0 ? 1.0f / static_cast<float>(Vh) : 1.0f;
 
-		// Translate: UE captures the cursor while RMB is held, so rebuild a
+		// Translate: UE captures the cursor while LMB is held, so rebuild a
 		// virtual ray from click screen pos + accumulated pixel deltas.
-		// Rotate doesn't need a cursor ray — only the camera basis.
 		FVector RayOrigin = CursorOrigin;
 		FVector RayDirection = CursorDirection;
-		if (bCtrlRmbHeld)
+		TranslateAccumPixels += RawDelta;
+		const FVector2D VirtPos = TranslateClickScreen + TranslateAccumPixels;
+		FVector VOrigin, VDir;
+		if (PC->DeprojectScreenPositionToWorld(VirtPos.X, VirtPos.Y, VOrigin, VDir))
 		{
-			TranslateAccumPixels += RawDelta;
-			const FVector2D VirtPos = TranslateClickScreen + TranslateAccumPixels;
-			FVector VOrigin, VDir;
-			if (PC->DeprojectScreenPositionToWorld(VirtPos.X, VirtPos.Y, VOrigin, VDir))
-			{
-				RayOrigin = VOrigin;
-				RayDirection = VDir;
-			}
+			RayOrigin = VOrigin;
+			RayDirection = VDir;
 		}
 
 		// simulate: reldx = dx/h, reldy = -dy/h (window Y-down → up-positive).
@@ -346,19 +321,13 @@ void UMjInputHandler::ProcessPerturbation(APlayerController* PC, float DeltaTime
 		MouseDeltaProcessor->Consume();
 	}
 
-	// Release edges: one LockCamera push on press-edge is balanced by exactly
-	// one UnlockCamera here (UnlockCamera is a no-op if not locked).
-	if (!bCtrlLmbHeld && bPrevCtrlLmbHeld)
-	{
-		Pert->StopDrag();
-		UnlockCamera(PC);
-	}
-	if (!bCtrlRmbHeld && bPrevCtrlRmbHeld)
+	// Release edge: one LockCamera push on press-edge is balanced by exactly
+	// one UnlockCamera here (UnlockCamera is a no-op if no body was selected).
+	if (!bPlainLmbHeld && bPrevPlainLmbHeld)
 	{
 		Pert->StopDrag();
 		UnlockCamera(PC);
 	}
 
-	bPrevCtrlLmbHeld = bCtrlLmbHeld;
-	bPrevCtrlRmbHeld = bCtrlRmbHeld;
+	bPrevPlainLmbHeld = bPlainLmbHeld;
 }

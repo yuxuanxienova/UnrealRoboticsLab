@@ -50,29 +50,23 @@ private:
 	/** @brief Processes keyboard hotkeys for simulation control and debug toggles. */
 	void ProcessHotkeys(APlayerController* PC);
 
-	/** @brief Drives perturbation gestures: double-click-LMB select, Ctrl+RMB
-	 *         translate drag, Ctrl+LMB rotate drag. Release stops drag. */
+	/** @brief Drives perturbation gestures: LMB press selects a MuJoCo body,
+	 *         LMB drag translates the perturb target, and release stops drag. */
 	void ProcessPerturbation(APlayerController* PC, float DeltaTime);
 
-	/** @brief Last time LMB was pressed (seconds since startup). Used to
-	 *         detect double-clicks within kDoubleClickWindowS seconds. */
-	float LastLMBPressTime = -1.0f;
-
-	/** @brief Previous-frame Ctrl+LMB / Ctrl+RMB held state for press-edge
-	 *         detection (matches simulate: Ctrl+LMB rotate, Ctrl+RMB translate). */
-	bool bPrevCtrlLmbHeld = false;
-	bool bPrevCtrlRmbHeld = false;
+	/** @brief Previous-frame plain LMB held state for press/release edge detection. */
+	bool bPrevPlainLmbHeld = false;
 
 	/** @brief Whether we currently hold a camera-input lock on the player
 	 *         controller. SetIgnoreLookInput/MoveInput are reference-counted,
 	 *         so we must balance each push() with exactly one pop(). */
 	bool bPerturbationCameraLocked = false;
 
-	/** @brief Screen-space position of the cursor at Ctrl+RMB press, plus the
+	/** @brief Screen-space position of the cursor at LMB press, plus the
 	 *         running sum of raw pixel deltas since. We rebuild a "virtual"
-	 *         cursor ray from these each tick because UE's RMB capture freezes
+	 *         cursor ray from these each tick because UE's mouse capture freezes
 	 *         GetMousePosition/DeprojectMousePositionToWorld while held —
-	 *         identical reason we needed the Slate pre-processor for LMB. */
+	 *         identical reason we needed the Slate pre-processor. */
 	FVector2D TranslateClickScreen = FVector2D::ZeroVector;
 	FVector2D TranslateAccumPixels = FVector2D::ZeroVector;
 

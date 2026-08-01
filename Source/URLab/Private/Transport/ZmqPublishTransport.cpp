@@ -228,7 +228,8 @@ void UURLabZmqPublishTransport::PostStep(mjModel* m, mjData* d)
 
 		if (Rec.TwistCtrl)
 		{
-			FVector Twist = Rec.TwistCtrl->GetTwist();
+			const uint8 Source = Rec.Articulation ? Rec.Articulation->ControlSource : 0;
+			FVector Twist = Rec.TwistCtrl->GetTwistForSource(Source);
 			FString TwistTopic = FString::Printf(TEXT("%s/twist"), *Rec.ArticPrefix);
 			float TwistData[3] = {(float)Twist.X, (float)Twist.Y, (float)Twist.Z};
 			SendTopic(ZmqPublisher, TwistTopic, ZMQ_SNDMORE);

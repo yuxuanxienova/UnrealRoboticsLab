@@ -33,7 +33,17 @@ UMjTwistController::UMjTwistController()
 FVector UMjTwistController::GetTwist() const
 {
 	FScopeLock Lock(&TwistMutex);
-	return FVector(Vx, Vy, YawRate);
+	return FVector(ZmqVx, ZmqVy, ZmqYawRate);
+}
+
+FVector UMjTwistController::GetTwistForSource(uint8 Source) const
+{
+	FScopeLock Lock(&TwistMutex);
+	if (Source == 1)
+	{
+		return FVector(UiVx, UiVy, UiYawRate);
+	}
+	return FVector(ZmqVx, ZmqVy, ZmqYawRate);
 }
 
 int32 UMjTwistController::GetActiveActions() const
@@ -45,18 +55,40 @@ int32 UMjTwistController::GetActiveActions() const
 void UMjTwistController::ResetTwist()
 {
 	FScopeLock Lock(&TwistMutex);
-	Vx = 0.f;
-	Vy = 0.f;
-	YawRate = 0.f;
+	ZmqVx = 0.f;
+	ZmqVy = 0.f;
+	ZmqYawRate = 0.f;
+	UiVx = 0.f;
+	UiVy = 0.f;
+	UiYawRate = 0.f;
 	ActionBitmask = 0;
 }
 
 void UMjTwistController::SetTwist(float InVx, float InVy, float InYawRate)
 {
+	SetTwistForSource(0, InVx, InVy, InYawRate);
+}
+
+void UMjTwistController::SetUITwist(float InVx, float InVy, float InYawRate)
+{
+	SetTwistForSource(1, InVx, InVy, InYawRate);
+}
+
+void UMjTwistController::SetTwistForSource(uint8 Source, float InVx, float InVy, float InYawRate)
+{
 	FScopeLock Lock(&TwistMutex);
-	Vx = InVx;
-	Vy = InVy;
-	YawRate = InYawRate;
+	if (Source == 1)
+	{
+		UiVx = InVx;
+		UiVy = InVy;
+		UiYawRate = InYawRate;
+	}
+	else
+	{
+		ZmqVx = InVx;
+		ZmqVy = InVy;
+		ZmqYawRate = InYawRate;
+	}
 }
 
 void UMjTwistController::BindInput(UEnhancedInputComponent* EIC)
@@ -93,28 +125,28 @@ void UMjTwistController::OnMove(const FInputActionValue& Value)
 	FVector2D Axis = Value.Get<FVector2D>();
 	FScopeLock Lock(&TwistMutex);
 	// Y axis = forward/backward, X axis = strafe (standard WASD convention)
-	Vx = FMath::Clamp(Axis.Y * MaxVx, -MaxVx, MaxVx);
-	Vy = FMath::Clamp(Axis.X * MaxVy, -MaxVy, MaxVy);
+	UiVx = FMath::Clamp(Axis.Y * MaxVx, -MaxVx, MaxVx);
+	UiVy = FMath::Clamp(Axis.X * MaxVy, -MaxVy, MaxVy);
 }
 
 void UMjTwistController::OnMoveCompleted(const FInputActionValue& Value)
 {
 	FScopeLock Lock(&TwistMutex);
-	Vx = 0.f;
-	Vy = 0.f;
+	UiVx = 0.f;
+	UiVy = 0.f;
 }
 
 void UMjTwistController::OnTurn(const FInputActionValue& Value)
 {
 	float Axis = Value.Get<float>();
 	FScopeLock Lock(&TwistMutex);
-	YawRate = FMath::Clamp(Axis * MaxYawRate, -MaxYawRate, MaxYawRate);
+	UiYawRate = FMath::Clamp(Axis * MaxYawRate, -MaxYawRate, MaxYawRate);
 }
 
 void UMjTwistController::OnTurnCompleted(const FInputActionValue& Value)
 {
 	FScopeLock Lock(&TwistMutex);
-	YawRate = 0.f;
+	UiYawRate = 0.f;
 }
 
 void UMjTwistController::OnActionPressed(const FInputActionValue& Value, int32 Index)

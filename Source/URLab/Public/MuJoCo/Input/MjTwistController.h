@@ -32,11 +32,12 @@ class UInputMappingContext;
 class UEnhancedInputComponent;
 
 /**
- * Captures WASD/gamepad input and stores twist commands (vx, vy, yaw_rate)
- * for broadcasting over ZMQ. Add to an AMjArticulation to enable possession-based control.
+ * Captures WASD/gamepad and external twist commands (vx, vy, yaw_rate).
+ * Local UI input and external ZMQ/RPC input are stored in separate slots so
+ * the active EControlSource can select exactly one writer for cmd_vel.
  *
- * Thread-safe: game thread writes twist state via input callbacks,
- * physics thread reads via GetTwist() for ZMQ broadcast.
+ * Thread-safe: game/RPC threads write twist state via input callbacks or RPC,
+ * physics thread reads via GetTwistForSource().
  */
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class URLAB_API UMjTwistController : public UActorComponent
@@ -76,8 +77,11 @@ public:
 
 	// ─── Thread-Safe Accessors ───
 
-	/** Returns current twist as FVector(Vx, Vy, YawRate) in m/s and rad/s. Thread-safe. */
+	/** Returns the external/ZMQ twist as FVector(Vx, Vy, YawRate). Thread-safe. */
 	FVector GetTwist() const;
+
+	/** Returns twist for a specific control source. Source: 0 = ZMQ, 1 = UI. Thread-safe. */
+	FVector GetTwistForSource(uint8 Source) const;
 
 	/** Returns bitmask of currently pressed action keys (bits 0-9). Thread-safe. */
 	int32 GetActiveActions() const;
@@ -92,7 +96,12 @@ public:
 	 *  the bridge's `set_twist` RPC for headless / Python-driven runs. Thread-safe. */
 	void SetTwist(float InVx, float InVy, float InYawRate);
 
+	/** Inject local UE/UI twist. Used by WASD/gamepad and the on-screen joystick. Thread-safe. */
+	void SetUITwist(float InVx, float InVy, float InYawRate);
+
 private:
+	void SetTwistForSource(uint8 Source, float InVx, float InVy, float InYawRate);
+
 	// Input handlers
 	void OnMove(const FInputActionValue& Value);
 	void OnMoveCompleted(const FInputActionValue& Value);
@@ -102,8 +111,11 @@ private:
 	void OnActionReleased(const FInputActionValue& Value, int32 Index);
 
 	mutable FCriticalSection TwistMutex;
-	float Vx = 0.f;
-	float Vy = 0.f;
-	float YawRate = 0.f;
+	float ZmqVx = 0.f;
+	float ZmqVy = 0.f;
+	float ZmqYawRate = 0.f;
+	float UiVx = 0.f;
+	float UiVy = 0.f;
+	float UiYawRate = 0.f;
 	int32 ActionBitmask = 0;
 };

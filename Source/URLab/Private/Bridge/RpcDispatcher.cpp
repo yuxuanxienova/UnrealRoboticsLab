@@ -1549,7 +1549,7 @@ TSharedPtr<FJsonObject> FURLabRpcDispatcher::BuildStepObservations(AAMjManager* 
 		// filled; rest stays zero. Only when a TwistController is attached.
 		if (UMjTwistController* TwistCtrl = Art->FindComponentByClass<UMjTwistController>())
 		{
-			const FVector Twist = TwistCtrl->GetTwist(); // (Vx, Vy, YawRate)
+			const FVector Twist = TwistCtrl->GetTwistForSource(Art->ControlSource); // (Vx, Vy, YawRate)
 
 			TArray<TSharedPtr<FJsonValue>> Linear;
 			Linear.Add(MakeShared<FJsonValueNumber>(Twist.X));
